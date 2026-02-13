@@ -46,6 +46,7 @@ spec:
             - --health-probe-bind-address=:{{ .Values.controller.health.port }}
             - --talosconfig-secret={{ include "tuppr.serviceAccountName" . }}-talosconfig
             - --metrics-secure={{ .Values.controller.metrics.secure }}
+            - --metrics-service-name={{ include "tuppr.metricsServiceName" . }}
             {{- if .Values.webhook.enabled }}
             - --webhook-config-name={{ include "tuppr.webhookConfigName" . }}
             - --webhook-service-name={{ include "tuppr.webhookServiceName" . }}

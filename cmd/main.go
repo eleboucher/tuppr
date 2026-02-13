@@ -2,13 +2,16 @@ package main
 
 import (
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
+
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"github.com/open-policy-agent/cert-controller/pkg/rotator"
@@ -17,7 +20,6 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -45,8 +47,7 @@ func init() {
 // nolint:gocyclo
 func main() {
 	var metricsAddr string
-	var metricsCertPath, metricsCertName, metricsCertKey string
-	var webhookCertPath, webhookCertName, webhookCertKey string
+	var metricsServiceName string
 	var webhookConfigName, webhookServiceName, webhookSecretName string
 	var enableLeaderElection bool
 	var probeAddr string
@@ -63,17 +64,12 @@ func main() {
 			"Enabling this will ensure there is only one active controller manager.")
 	flag.BoolVar(&secureMetrics, "metrics-secure", true,
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
-	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
-	flag.StringVar(&webhookCertName, "webhook-cert-name", "tls.crt", "The name of the webhook certificate file.")
-	flag.StringVar(&webhookCertKey, "webhook-cert-key", "tls.key", "The name of the webhook key file.")
-	flag.StringVar(&metricsCertPath, "metrics-cert-path", "",
-		"The directory that contains the metrics server certificate.")
-	flag.StringVar(&metricsCertName, "metrics-cert-name", "tls.crt", "The name of the metrics server certificate file.")
-	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	flag.StringVar(&talosConfigSecret, "talosconfig-secret", "tuppr",
 		"The name of the secret containing talos configuration")
+	flag.StringVar(&metricsServiceName, "metrics-service-name", "",
+		"The name of the service name of the metric server")
 	flag.StringVar(&webhookConfigName, "webhook-config-name", "",
 		"The name of the ValidatingWebhookConfiguration to patch with CA bundle")
 	flag.StringVar(&webhookServiceName, "webhook-service-name", "",
@@ -95,6 +91,10 @@ func main() {
 		controllerNamespace = "tuppr-system" // Default namespace
 	}
 
+	if metricsServiceName == "" {
+		metricsServiceName = "tuppr-metrics-service"
+	}
+
 	setupLog.Info("Starting tuppr controller manager",
 		"talosconfig-secret", talosConfigSecret,
 		"controller-namespace", controllerNamespace)
@@ -110,57 +110,37 @@ func main() {
 		c.NextProtos = []string{"http/1.1"}
 	}
 
+	certDir := filepath.Join(os.TempDir(), "k8s-webhook-server", "serving-certs")
+	if err := os.MkdirAll(certDir, 0755); err != nil {
+		setupLog.Error(err, "unable to create cert dir")
+		os.Exit(1)
+	}
+
 	if !enableHTTP2 {
 		tlsOpts = append(tlsOpts, disableHTTP2)
 	}
-
-	// Create watchers for metrics and webhooks certificates
-	var metricsCertWatcher, webhookCertWatcher *certwatcher.CertWatcher
-
-	// Initial webhook TLS options
-	webhookTLSOpts := tlsOpts
-
-	if len(webhookCertPath) > 0 {
-		setupLog.Info("Initializing webhook certificate watcher using provided certificates",
-			"webhook-cert-path", webhookCertPath, "webhook-cert-name", webhookCertName, "webhook-cert-key", webhookCertKey)
-
-		var err error
-		webhookCertWatcher, err = certwatcher.New(
-			filepath.Join(webhookCertPath, webhookCertName),
-			filepath.Join(webhookCertPath, webhookCertKey),
-		)
-		if err != nil {
-			setupLog.Error(err, "Failed to initialize webhook certificate watcher")
-			os.Exit(1)
-		}
-
-		webhookTLSOpts = append(webhookTLSOpts, func(config *tls.Config) {
-			config.GetCertificate = webhookCertWatcher.GetCertificate
-		})
-	}
-
-	// When using cert-controller rotation, use a dynamic GetCertificate callback
-	// instead of CertDir. The rotator writes certs asynchronously after mgr.Start(),
-	// so the webhook server must tolerate missing cert files during startup.
-	if webhookConfigName != "" && webhookCertPath == "" {
-		certDir := filepath.Join(os.TempDir(), "k8s-webhook-server", "serving-certs")
-		certFile := filepath.Join(certDir, webhookCertName)
-		keyFile := filepath.Join(certDir, webhookCertKey)
-		webhookTLSOpts = append(webhookTLSOpts, func(config *tls.Config) {
-			config.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-				cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-				if err != nil {
-					return nil, err
-				}
-				return &cert, nil
-			}
-		})
-	}
-
 	webhookServer := webhook.NewServer(webhook.Options{
-		TLSOpts: webhookTLSOpts,
+		CertDir: certDir,
+		TLSOpts: tlsOpts,
 	})
 
+	metricsTLS := append([]func(*tls.Config){}, tlsOpts...)
+
+	dynamicCertLoader := func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		cert, err := tls.LoadX509KeyPair(
+			filepath.Join(certDir, "tls.crt"),
+			filepath.Join(certDir, "tls.key"),
+		)
+		if err != nil {
+			// If the rotator hasn't finished yet, this returns an error.
+			// The scraper will just retry later.
+			return nil, err
+		}
+		return &cert, nil
+	}
+	metricsTLS = append(metricsTLS, func(c *tls.Config) {
+		c.GetCertificate = dynamicCertLoader
+	})
 	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'. The Metrics options configure the server.
 	// More info:
 	// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.21.0/pkg/metrics/server
@@ -168,7 +148,7 @@ func main() {
 	metricsServerOptions := metricsserver.Options{
 		BindAddress:   metricsAddr,
 		SecureServing: secureMetrics,
-		TLSOpts:       tlsOpts,
+		TLSOpts:       metricsTLS,
 	}
 
 	if secureMetrics {
@@ -177,25 +157,6 @@ func main() {
 		// can access the metrics endpoint. The RBAC are configured in 'config/rbac/kustomization.yaml'. More info:
 		// https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.21.0/pkg/metrics/filters#WithAuthenticationAndAuthorization
 		metricsServerOptions.FilterProvider = filters.WithAuthenticationAndAuthorization
-	}
-
-	if len(metricsCertPath) > 0 {
-		setupLog.Info("Initializing metrics certificate watcher using provided certificates",
-			"metrics-cert-path", metricsCertPath, "metrics-cert-name", metricsCertName, "metrics-cert-key", metricsCertKey)
-
-		var err error
-		metricsCertWatcher, err = certwatcher.New(
-			filepath.Join(metricsCertPath, metricsCertName),
-			filepath.Join(metricsCertPath, metricsCertKey),
-		)
-		if err != nil {
-			setupLog.Error(err, "to initialize metrics certificate watcher", "error", err)
-			os.Exit(1)
-		}
-
-		metricsServerOptions.TLSOpts = append(metricsServerOptions.TLSOpts, func(config *tls.Config) {
-			config.GetCertificate = metricsCertWatcher.GetCertificate
-		})
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
@@ -224,37 +185,37 @@ func main() {
 
 	// Set up self-signed certificate rotation for webhooks
 	certSetupFinished := make(chan struct{})
-	if webhookConfigName != "" {
-		dnsName := fmt.Sprintf("%s.%s.svc", webhookServiceName, controllerNamespace)
-		setupLog.Info("setting up cert rotation",
-			"webhook-config", webhookConfigName,
-			"dns-name", dnsName,
-			"secret", webhookSecretName,
-		)
-
-		if err := rotator.AddRotator(mgr, &rotator.CertRotator{
-			SecretKey: types.NamespacedName{
-				Namespace: controllerNamespace,
-				Name:      webhookSecretName,
+	dnsName := fmt.Sprintf("%s.%s.svc", webhookServiceName, controllerNamespace)
+	setupLog.Info("setting up cert rotation",
+		"webhook-config", webhookConfigName,
+		"dns-name", dnsName,
+		"secret", webhookSecretName,
+	)
+	if err := rotator.AddRotator(mgr, &rotator.CertRotator{
+		SecretKey: types.NamespacedName{
+			Namespace: controllerNamespace,
+			Name:      webhookSecretName,
+		},
+		CertDir:        certDir,
+		CAName:         "tuppr-ca",
+		CAOrganization: "tuppr",
+		DNSName:        dnsName,
+		ExtraDNSNames: []string{
+			fmt.Sprintf("%s.%s.svc", webhookServiceName, controllerNamespace),
+			fmt.Sprintf("%s.%s.svc.cluster.local", webhookServiceName, controllerNamespace),
+			fmt.Sprintf("%s.%s.svc", metricsServiceName, controllerNamespace),
+		},
+		IsReady:              certSetupFinished,
+		EnableReadinessCheck: true,
+		Webhooks: []rotator.WebhookInfo{
+			{
+				Name: webhookConfigName,
+				Type: rotator.Validating,
 			},
-			CertDir:        filepath.Join(os.TempDir(), "k8s-webhook-server", "serving-certs"),
-			CAName:         "tuppr-ca",
-			CAOrganization: "tuppr",
-			DNSName:        dnsName,
-			ExtraDNSNames:  []string{fmt.Sprintf("%s.%s.svc.cluster.local", webhookServiceName, controllerNamespace)},
-			IsReady:        certSetupFinished,
-			Webhooks: []rotator.WebhookInfo{
-				{
-					Name: webhookConfigName,
-					Type: rotator.Validating,
-				},
-			},
-		}); err != nil {
-			setupLog.Error(err, "unable to set up cert rotation")
-			os.Exit(1)
-		}
-	} else {
-		close(certSetupFinished)
+		},
+	}); err != nil {
+		setupLog.Error(err, "unable to set up cert rotation")
+		os.Exit(1)
 	}
 
 	setupLog.Info("Setting up controllers")
@@ -278,48 +239,44 @@ func main() {
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
-
-	if metricsCertWatcher != nil {
-		setupLog.Info("Adding metrics certificate watcher to manager")
-		if err := mgr.Add(metricsCertWatcher); err != nil {
-			setupLog.Error(err, "unable to add metrics certificate watcher to manager")
-			os.Exit(1)
-		}
-	}
-
-	if webhookCertWatcher != nil {
-		setupLog.Info("Adding webhook certificate watcher to manager")
-		if err := mgr.Add(webhookCertWatcher); err != nil {
-			setupLog.Error(err, "unable to add webhook certificate watcher to manager")
-			os.Exit(1)
-		}
-	}
-
-	if err = (&tupprwebhook.TalosUpgradeValidator{
+	if err := (&tupprwebhook.TalosUpgradeValidator{
 		Client: mgr.GetClient(),
 	}).SetupWebhookWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create webhook", "webhook", "TalosUpgrade")
 		os.Exit(1)
 	}
 
-	if err = (&tupprwebhook.KubernetesUpgradeValidator{
+	if err := (&tupprwebhook.KubernetesUpgradeValidator{
 		Client: mgr.GetClient(),
 	}).SetupWebhookWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create webhook", "webhook", "KubernetesUpgrade")
 		os.Exit(1)
 	}
-	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)
 	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+	if err := mgr.AddReadyzCheck("readyz", func(req *http.Request) error {
+		return mgr.GetWebhookServer().StartedChecker()(req)
+	}); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
 		os.Exit(1)
 	}
 
-	setupLog.Info("starting manager")
+	// Ready Check: Blocks until certificates are actually on disk.
+	if err := mgr.AddReadyzCheck("certs-ready", func(req *http.Request) error {
+		select {
+		case <-certSetupFinished:
+			return nil
+		default:
+			return errors.New("certificates not ready yet")
+		}
+	}); err != nil {
+		setupLog.Error(err, "unable to set up ready check")
+		os.Exit(1)
+	}
+
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
